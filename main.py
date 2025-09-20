@@ -34,6 +34,11 @@ def get_kst_datetime() -> datetime:
     kst = pytz.timezone('Asia/Seoul')
     return datetime.now(kst)
 
+def get_kst_date_folder() -> str:
+    """한국 시간 기준 날짜 폴더명 반환 (YYMMDD 형식)"""
+    kst = pytz.timezone('Asia/Seoul')
+    return datetime.now(kst).strftime('%y%m%d')
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +83,7 @@ DATABASE_CONFIG = {
 
 # 전역 변수
 db_pool: Optional[AsyncConnectionPool] = None
+image_counter: Dict[str, int] = {}  # 동일 사용자의 이미지 카운터
 
 # 디렉토리 생성
 KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,6 +111,13 @@ async def init_database():
     except Exception as e:
         logger.error(f"데이터베이스 연결 실패: {str(e)}")
         raise
+
+async def close_database():
+    """데이터베이스 연결 종료"""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("PostgreSQL 연결 풀 종료 완료")
 
 async def save_image_upload_to_db(
     username: str,
@@ -175,11 +188,47 @@ def validate_kakao_request(data: Dict[Any, Any]) -> bool:
     except (KeyError, TypeError):
         return False
 
-def generate_unique_filename(user_id: str, extension: str = ".jpg") -> str:
-    """고유한 파일명 생성"""
-    timestamp = get_kst_timestamp()
-    unique_id = str(uuid.uuid4())[:8]
-    return f"kakao_{user_id[:8]}_{timestamp}_{unique_id}{extension}"
+def generate_unique_filename(username: str, user_id: str, extension: str = ".jpg") -> tuple[str, Path]:
+    """
+    고유한 파일명 생성 및 날짜별 폴더 경로 반환
+    Returns: (filename, full_directory_path)
+    """
+    global image_counter
+    
+    # 날짜별 폴더 생성 (YYMMDD 형식)
+    date_folder = get_kst_date_folder()
+    date_dir = KAKAO_IMAGE_DIR / date_folder
+    date_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 사용자별 카운터 키 생성
+    counter_key = f"{username}_{user_id}_{date_folder}"
+    
+    # 카운터 증가
+    if counter_key not in image_counter:
+        # 해당 폴더의 기존 파일들 확인하여 카운터 초기화
+        existing_files = list(date_dir.glob(f"{username}_{user_id[:8]}_*{extension}"))
+        if existing_files:
+            # 가장 큰 번호 찾기
+            max_num = 0
+            for file in existing_files:
+                try:
+                    # 파일명에서 번호 추출 (username_userid_번호.확장자)
+                    parts = file.stem.split('_')
+                    if len(parts) >= 3:
+                        num = int(parts[-1])
+                        max_num = max(max_num, num)
+                except (ValueError, IndexError):
+                    continue
+            image_counter[counter_key] = max_num + 1
+        else:
+            image_counter[counter_key] = 1
+    else:
+        image_counter[counter_key] += 1
+    
+    # 파일명 생성: username_userid(앞8자리)_번호.확장자
+    filename = f"{username}_{user_id[:8]}_{image_counter[counter_key]}{extension}"
+    
+    return filename, date_dir
 
 def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
     """카카오톡 데이터에서 이미지 URL들 추출"""
@@ -289,15 +338,15 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
         elif "webp" in content_type:
             extension = ".webp"
         
-        # 파일명 생성 및 저장
-        filename = generate_unique_filename(user_id, extension)
-        file_path = KAKAO_IMAGE_DIR / filename
+        # 파일명 및 경로 생성
+        filename, date_dir = generate_unique_filename(username, user_id, extension)
+        file_path = date_dir / filename
         
         # 파일 저장
         async with aiofiles.open(file_path, 'wb') as f:
             await f.write(image_data)
         
-        logger.info(f"이미지 저장 완료: {filename} ({len(image_data):,} bytes)")
+        logger.info(f"이미지 저장 완료: {file_path} ({len(image_data):,} bytes)")
         
         return {
             "status": "success",
@@ -305,7 +354,8 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
             "file_path": str(file_path),
             "file_size": len(image_data),
             "content_type": content_type,
-            "original_url": url
+            "original_url": url,
+            "date_folder": date_dir.name
         }
         
     except asyncio.TimeoutError:
@@ -325,8 +375,7 @@ def format_request_summary(data: Dict[Any, Any], success_count: int, total_image
 처리 시간: {get_kst_time()}"""
 
     if total_images > 0:
-        summary += f"""
-✅ 이미지 처리: {success_count}/{total_images}개 성공"""
+        summary += f"\n✅ 이미지 처리: {success_count}/{total_images}개 성공"
     
     return summary
 
@@ -389,6 +438,7 @@ async def process_kakao_request(request: Request):
         image_urls = extract_image_urls_from_kakao_data(data)
         downloaded_images = []
         saved_to_db_count = 0
+        date_folder = None
         
         if image_urls:
             logger.info(f"발견된 이미지 URL: {len(image_urls)}개")
@@ -417,6 +467,9 @@ async def process_kakao_request(request: Request):
                             
                             # 성공한 이미지만 DB에 저장
                             if result.get("status") == "success":
+                                if not date_folder:
+                                    date_folder = result.get("date_folder")
+                                    
                                 db_saved = await save_image_upload_to_db(
                                     username=username,
                                     original_url=image_urls[i],
@@ -476,6 +529,7 @@ async def health_check():
     return JSONResponse({
         "status": "healthy",
         "timestamp": get_kst_datetime().isoformat(),
+        "current_date_folder": get_kst_date_folder(),
         "kakao_image_dir": str(KAKAO_IMAGE_DIR),
         "max_file_size_mb": MAX_FILE_SIZE // (1024*1024),
         "allowed_extensions": list(ALLOWED_EXTENSIONS),
@@ -488,6 +542,7 @@ async def root():
     return JSONResponse({
         "message": "카카오톡 이미지 업로드 API 서버",
         "version": "2.0.0",
+        "current_date_folder": get_kst_date_folder(),
         "endpoints": {
             "kakao_chat": "/kakao/chat",
             "health_check": "/health",
@@ -502,6 +557,7 @@ if __name__ == "__main__":
     print("카카오톡 이미지 업로드 API 서버 시작")
     print("=" * 70)
     print(f"이미지 저장 디렉토리: {KAKAO_IMAGE_DIR.absolute()}")
+    print(f"오늘 날짜 폴더: {get_kst_date_folder()}")
     print(f"최대 파일 크기: {MAX_FILE_SIZE // (1024*1024)}MB")
     print(f"지원 파일 형식: {', '.join(ALLOWED_EXTENSIONS)}")
     print(f"최대 동시 업로드: {MAX_CONCURRENT_UPLOADS}개")
