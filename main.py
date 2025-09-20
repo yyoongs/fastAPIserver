@@ -292,9 +292,6 @@ def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
         # 중복 제거 및 빈 URL 제거
         urls = list(set([url for url in urls if url and len(url) > 10]))
         
-        # URL 디코딩
-        urls = [unquote(url) for url in urls]
-        
     except Exception as e:
         logger.error(f"URL 추출 실패: {str(e)}")
     
@@ -495,7 +492,7 @@ async def process_kakao_request(request: Request):
                     "outputs": [
                         {
                             "simpleText": {
-                                "text": f"❌ 이미지 처리가 실패했습니다. ({success_count}/{len(image_urls)}개)\n다시 시도해주세요."
+                                "text": f"❌ 이미지 처리가 실패했습니다. ({success_count}/{len(image_urls)}개)\n 잠시후 다시 시도해주세요."
                             }
                         }
                     ]
