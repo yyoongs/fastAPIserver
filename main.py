@@ -342,6 +342,7 @@ async def root():
             "delete_file": "/files/{filename}",
             "download_all": "/download/all",
             "kakao_chat": "/kakao/chat",
+            "kakao_debug": "/kakao/debug",
             "health_check": "/health"
         }
     })
@@ -365,77 +366,79 @@ async def process_kakao_request(request: Request):
         bot = data["bot"]
         action = data["action"]
         
-        processed_data = {
-            "request_time": datetime.now().isoformat(),
-            "summary": {
-                "user_message": user_request["utterance"],
-                "user_id": user_request["user"]["id"],
-                "bot_name": bot["name"],
-                "intent_name": intent["name"],
-                "block_name": user_request["block"]["name"],
-                "timezone": user_request["timezone"]
-            },
-            "detailed_info": {
-                "intent": {
-                    "id": intent["id"],
-                    "name": intent["name"]
-                },
-                "user": {
-                    "id": user_request["user"]["id"],
-                    "type": user_request["user"]["type"],
-                    "properties": user_request["user"].get("properties", {})
-                },
-                "bot": {
-                    "id": bot["id"],
-                    "name": bot["name"]
-                },
-                "action": {
-                    "id": action["id"],
-                    "name": action["name"],
-                    "params": action.get("params", {}),
-                    "detail_params": action.get("detailParams", {}),
-                    "client_extra": action.get("clientExtra")
-                },
-                "request_params": user_request.get("params", {}),
-                "language": user_request.get("lang")
-            },
-            "analysis": {
-                "is_ignore_request": user_request.get("params", {}).get("ignoreMe") == "true",
-                "has_parameters": len(user_request.get("params", {})) > 0,
-                "has_user_properties": len(user_request["user"].get("properties", {})) > 0,
-                "utterance_length": len(user_request["utterance"]),
-                "timezone_region": user_request["timezone"].split("/")[-1] if "/" in user_request["timezone"] else user_request["timezone"]
-            }
-        }
+        # 사용자 발화 내용 기반으로 응답 생성
+        user_message = user_request["utterance"]
+        user_id = user_request["user"]["id"]
+        user_type = user_request["user"]["type"]
+        user_properties = user_request["user"].get("properties", {})
+        bot_name = bot["name"]
+        intent_name = intent["name"]
+        block_name = user_request["block"]["name"]
+        timezone = user_request["timezone"]
+        request_params = user_request.get("params", {})
+        action_name = action["name"]
         
-        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {user_request['user']['id']}, 발화: '{user_request['utterance'][:50]}...'")
+        # 사용자 속성 정보를 문자열로 변환
+        properties_text = ""
+        if user_properties:
+            properties_list = [f"{k}: {v}" for k, v in user_properties.items()]
+            properties_text = f"\n- 사용자 속성: {', '.join(properties_list)}"
         
-        # 응답 데이터 (실제 카카오톡 챗봇에서 사용할 형태)
-        response_data = {
+        # 요청 파라미터 정보를 문자열로 변환
+        params_text = ""
+        if request_params:
+            params_list = [f"{k}: {v}" for k, v in request_params.items()]
+            params_text = f"\n- 요청 파라미터: {', '.join(params_list)}"
+        
+        # 상세한 응답 텍스트 생성 (모든 사용자 정보 포함)
+        response_text = f"""안녕하세요! '{user_message}' 메시지를 잘 받았습니다.
+
+📊 전달받은 정보:
+- 사용자 ID: {user_id}
+- 사용자 타입: {user_type}{properties_text}
+- 봇 이름: {bot_name}
+- 의도: {intent_name}
+- 블록: {block_name}
+- 액션: {action_name}
+- 시간대: {timezone}{params_text}
+- 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+✅ 모든 정보가 정상적으로 수신되었습니다."""
+        
+        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {user_id} ({user_type}), 발화: '{user_message[:50]}...', 속성: {len(user_properties)}개")
+        
+        # 카카오톡 표준 응답 형식으로 반환
+        return {
             "version": "2.0",
             "template": {
                 "outputs": [
                     {
                         "simpleText": {
-                            "text": f"안녕하세요! '{user_request['utterance']}' 메시지를 잘 받았습니다.\n\n📊 요청 정보:\n- 사용자 ID: {user_request['user']['id']}\n- 봇 이름: {bot['name']}\n- 시간대: {user_request['timezone']}\n- 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            "text": response_text
                         }
                     }
                 ]
             }
         }
         
-        return JSONResponse({
-            "status": "success",
-            "message": "카카오톡 챗봇 요청 처리 완료",
-            "processed_data": processed_data,
-            "kakao_response": response_data
-        })
-        
+    except HTTPException:
+        # HTTPException은 그대로 다시 raise
+        raise
     except Exception as e:
         logger.error(f"❌ 카카오톡 요청 처리 실패: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"카카오톡 요청 처리 실패: {str(e)}")
-
-@app.get("/download/all")
+        # 에러 발생 시에도 카카오톡 표준 형식으로 응답
+        return {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": "죄송합니다. 요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+                        }
+                    }
+                ]
+            }
+        }
 async def download_all_files():
     """업로드된 모든 파일을 ZIP으로 다운로드"""
     logger.info("📦 전체 파일 다운로드 요청")
@@ -562,7 +565,8 @@ if __name__ == "__main__":
     print("   - DELETE /files/{name}     : 파일 삭제")
     print("   - GET  /download/all       : 모든 파일 ZIP 다운로드")
     print("   - GET  /download/info      : 다운로드 정보")
-    print("   - POST /kakao/chat         : 카카오톡 챗봇 요청 처리")
+    print("   - POST /kakao/chat         : 카카오톡 챗봇 응답 (표준 형식)")
+    print("   - POST /kakao/debug        : 카카오톡 요청 분석 (디버깅용)")
     print("=" * 70)
     print("⚠️  서버를 중지하려면 Ctrl+C를 누르세요")
     print("=" * 70)
