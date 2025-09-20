@@ -119,30 +119,75 @@ def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
     urls = []
     
     try:
-        # detailParams에서 secureUrls 추출
+        # action > detailParams에서 userimage 데이터 추출
         detail_params = data.get("action", {}).get("detailParams", {})
+        userimage_data = detail_params.get("userimage", {})
         
-        # secureUrls가 문자열로 되어 있는 경우 (예: "List(http://...)")
-        secure_urls_str = detail_params.get("secureUrls", "")
-        if secure_urls_str:
-            # URL 패턴으로 추출
-            url_pattern = r'https?://[^\s,)\]"]+'
-            found_urls = re.findall(url_pattern, secure_urls_str)
-            urls.extend(found_urls)
-        
-        # 다른 가능한 위치에서도 URL 찾기
-        for key, value in detail_params.items():
-            if isinstance(value, str) and ("http" in value):
-                found_urls = re.findall(r'https?://[^\s,)\]"]+', value)
+        # userimage의 value가 JSON 문자열인 경우
+        userimage_value = userimage_data.get("value", "")
+        if userimage_value:
+            try:
+                # JSON 파싱
+                parsed_data = json.loads(userimage_value)
+                secure_urls_str = parsed_data.get("secureUrls", "")
+                
+                if secure_urls_str:
+                    # "List(...)" 형태에서 URL 추출
+                    if secure_urls_str.startswith("List(") and secure_urls_str.endswith(")"):
+                        # List() 안의 내용 추출
+                        urls_content = secure_urls_str[5:-1]  # "List(" 와 ")" 제거
+                        
+                        # URL 패턴으로 추출 (더 정확한 패턴 사용)
+                        url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+                        found_urls = re.findall(url_pattern, urls_content)
+                        urls.extend(found_urls)
+                    else:
+                        # 직접 URL 문자열인 경우
+                        url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+                        found_urls = re.findall(url_pattern, secure_urls_str)
+                        urls.extend(found_urls)
+                        
+            except json.JSONDecodeError:
+                # JSON 파싱 실패시 문자열에서 직접 URL 추출
+                url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+                found_urls = re.findall(url_pattern, userimage_value)
                 urls.extend(found_urls)
         
-        # 중복 제거
-        urls = list(set(urls))
+        # userimage의 origin에서도 확인 (백업용)
+        userimage_origin = userimage_data.get("origin", "")
+        if userimage_origin and "http" in userimage_origin:
+            url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+            found_urls = re.findall(url_pattern, userimage_origin)
+            urls.extend(found_urls)
+        
+        # params에서도 확인 (백업용)
+        params = data.get("action", {}).get("params", {})
+        userimage_param = params.get("userimage", "")
+        if userimage_param and "http" in userimage_param:
+            try:
+                parsed_data = json.loads(userimage_param)
+                secure_urls_str = parsed_data.get("secureUrls", "")
+                if secure_urls_str:
+                    url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+                    found_urls = re.findall(url_pattern, secure_urls_str)
+                    urls.extend(found_urls)
+            except (json.JSONDecodeError, TypeError):
+                url_pattern = r'https?://[^\s,)"\'\]]+(?:\?[^\s,)"\'\]]+)?'
+                found_urls = re.findall(url_pattern, userimage_param)
+                urls.extend(found_urls)
+        
+        # 중복 제거 및 빈 URL 제거
+        urls = list(set([url for url in urls if url and len(url) > 10]))
+        
+        # URL 디코딩 (필요시)
+        from urllib.parse import unquote
+        urls = [unquote(url) for url in urls]
         
     except Exception as e:
         logger.error(f"URL 추출 실패: {str(e)}")
     
     return urls
+
 
 async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id: str, username: str) -> Dict[str, Any]:
     """카카오톡 이미지 다운로드 및 저장"""
