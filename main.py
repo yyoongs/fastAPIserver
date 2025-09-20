@@ -365,7 +365,7 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
         logger.error(f"이미지 다운로드 실패: {str(e)}")
         return {"status": "error", "error": str(e)}
 
-def format_request_summary(data: Dict[Any, Any], success_count: int, total_images: int) -> str:
+def format_request_summary(data: Dict[Any, Any], success_count: int, total_images: int, date_folder: str = None) -> str:
     """요청 정보를 요약 형태로 포맷팅"""
     action_params = data.get("action", {}).get("params", {})
     username = action_params.get("username", "Unknown")
@@ -437,6 +437,7 @@ async def process_kakao_request(request: Request):
         # 이미지 URL 추출 및 다운로드
         image_urls = extract_image_urls_from_kakao_data(data)
         downloaded_images = []
+        saved_files = []  # 저장된 파일 경로 리스트 (롤백용)
         saved_to_db_count = 0
         date_folder = None
         
@@ -465,25 +466,57 @@ async def process_kakao_request(request: Request):
                         else:
                             downloaded_images.append(result)
                             
-                            # 성공한 이미지만 DB에 저장
+                            # 성공한 이미지 경로 저장
                             if result.get("status") == "success":
+                                saved_files.append(result.get("file_path"))
                                 if not date_folder:
                                     date_folder = result.get("date_folder")
-                                    
-                                db_saved = await save_image_upload_to_db(
-                                    username=username,
-                                    original_url=image_urls[i],
-                                    user_id=user_id,
-                                    image_data=result
-                                )
-                                if db_saved:
-                                    saved_to_db_count += 1
         
         # 성공한 다운로드 수 계산
         success_count = sum(1 for img in downloaded_images if img.get("status") == "success")
         
+        # 모든 이미지가 성공적으로 다운로드되지 않은 경우 롤백
+        if image_urls and success_count != len(image_urls):
+            logger.warning(f"이미지 처리 실패 - 성공: {success_count}/{len(image_urls)}개, 롤백 시작")
+            
+            # 저장된 파일들 삭제 (롤백)
+            for file_path in saved_files:
+                try:
+                    if file_path and Path(file_path).exists():
+                        Path(file_path).unlink()
+                        logger.info(f"롤백: 파일 삭제 - {file_path}")
+                except Exception as e:
+                    logger.error(f"파일 삭제 실패 - {file_path}: {str(e)}")
+            
+            # 실패 응답 반환
+            return {
+                "version": "2.0",
+                "template": {
+                    "outputs": [
+                        {
+                            "simpleText": {
+                                "text": f"❌ 이미지 처리가 실패했습니다. ({success_count}/{len(image_urls)}개)\n다시 시도해주세요."
+                            }
+                        }
+                    ]
+                }
+            }
+        
+        # 모든 이미지가 성공한 경우에만 DB 저장
+        if success_count > 0:
+            for i, img in enumerate(downloaded_images):
+                if img.get("status") == "success":
+                    db_saved = await save_image_upload_to_db(
+                        username=username,
+                        original_url=image_urls[i],
+                        user_id=user_id,
+                        image_data=img
+                    )
+                    if db_saved:
+                        saved_to_db_count += 1
+        
         # 응답 텍스트 생성
-        response_text = format_request_summary(data, success_count, len(image_urls))
+        response_text = format_request_summary(data, success_count, len(image_urls), date_folder)
         if saved_to_db_count > 0:
             response_text += f"\n💾 DB 저장: {saved_to_db_count}개 완료"
         
