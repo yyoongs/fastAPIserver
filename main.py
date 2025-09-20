@@ -7,13 +7,16 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import sys
 import json
 import re
 import aiohttp
 import pytz
 from urllib.parse import unquote
+import psycopg
+from psycopg_pool import AsyncConnectionPool
+from contextlib import asynccontextmanager
 
 # 한국 시간 유틸리티 함수들
 def get_kst_time() -> str:
@@ -64,6 +67,18 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_CONCURRENT_UPLOADS = 2000
 
+# PostgreSQL 설정
+DATABASE_CONFIG = {
+    "host": "dpg-d37aglogjchc73c45dh0-a.oregon-postgres.render.com",
+    "database": "chatbot_ain6",
+    "port": 5432,
+    "user": "chatbot_ain6_user",
+    "password": "QLC4mbPSwJuZR0LVvKZFhnjC80bCjacj"
+}
+
+# 전역 변수
+db_pool: Optional[AsyncConnectionPool] = None
+
 # 디렉토리 생성
 KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"카카오 이미지 디렉토리 확인: {KAKAO_IMAGE_DIR.absolute()}")
@@ -72,6 +87,65 @@ logger.info(f"카카오 이미지 디렉토리 확인: {KAKAO_IMAGE_DIR.absolute
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 logger.info(f"동시 업로드 제한: {MAX_CONCURRENT_UPLOADS}개")
 
+async def init_database():
+    """데이터베이스 연결 풀 초기화"""
+    global db_pool
+    try:
+        # PostgreSQL 연결 문자열 생성
+        connection_string = f"postgresql://{DATABASE_CONFIG['user']}:{DATABASE_CONFIG['password']}@{DATABASE_CONFIG['host']}:{DATABASE_CONFIG['port']}/{DATABASE_CONFIG['database']}"
+        
+        db_pool = AsyncConnectionPool(
+            connection_string,
+            min_size=1,
+            max_size=10,
+            timeout=60
+        )
+        logger.info("PostgreSQL 연결 풀 생성 완료")
+        
+    except Exception as e:
+        logger.error(f"데이터베이스 연결 실패: {str(e)}")
+        raise
+
+async def save_image_upload_to_db(
+    username: str,
+    original_url: str, 
+    user_id: str,
+    image_data: Dict[str, Any]
+) -> bool:
+    """이미지 업로드 정보를 데이터베이스에 저장"""
+    global db_pool
+    if not db_pool:
+        logger.error("데이터베이스 연결 풀이 초기화되지 않음")
+        return False
+    
+    insert_sql = """
+    INSERT INTO kakao_image_uploads (
+        username, original_url, user_id, filename, file_path, 
+        file_size, content_type, upload_time
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    
+    try:
+        async with db_pool.connection() as conn:
+            await conn.execute(
+                insert_sql,
+                (
+                    username,
+                    original_url,
+                    user_id,
+                    image_data["filename"],
+                    image_data["file_path"],
+                    image_data["file_size"],
+                    image_data["content_type"],
+                    get_kst_time()
+                )
+            )
+        logger.info(f"DB 저장 완료: {image_data['filename']}")
+        return True
+    except Exception as e:
+        logger.error(f"DB 저장 실패: {str(e)}")
+        return False
+    
 def validate_kakao_request(data: Dict[Any, Any]) -> bool:
     """카카오톡 요청 데이터 유효성 검사"""
     required_fields = [
@@ -271,12 +345,20 @@ async def startup_event():
     logger.info(f"최대 파일 크기: {MAX_FILE_SIZE // (1024*1024)}MB")
     logger.info(f"지원 파일 형식: {', '.join(ALLOWED_EXTENSIONS)}")
     logger.info(f"최대 동시 업로드: {MAX_CONCURRENT_UPLOADS}개")
+    
+    # 데이터베이스 초기화
+    await init_database()
+    
     logger.info("=" * 60)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """서버 종료 시 실행되는 이벤트"""
     logger.info("서버 종료 중...")
+    
+    # 데이터베이스 연결 종료
+    await close_database()
+    
     logger.info("안전하게 종료되었습니다.")
 
 @app.post("/kakao/chat")
@@ -302,14 +384,17 @@ async def process_kakao_request(request: Request):
         user_message = user_request["utterance"]
         user_id = user_request["user"]["id"]
         user_type = user_request["user"]["type"]
-        user_properties = user_request["user"].get("properties", {})
-        username = user_properties.get("username", "Unknown")
+        
+        # action params에서 username 추출
+        action_params = data.get("action", {}).get("params", {})
+        username = action_params.get("username", "Unknown")
         
         logger.info(f"카카오톡 요청 수신 - 사용자: {username}, 메시지: {user_message}")
         
         # 이미지 URL 추출 및 다운로드
         image_urls = extract_image_urls_from_kakao_data(data)
         downloaded_images = []
+        saved_to_db_count = 0
         
         if image_urls:
             logger.info(f"발견된 이미지 URL: {len(image_urls)}개")
@@ -335,14 +420,27 @@ async def process_kakao_request(request: Request):
                             })
                         else:
                             downloaded_images.append(result)
+                            
+                            # 성공한 이미지만 DB에 저장
+                            if result.get("status") == "success":
+                                db_saved = await save_image_upload_to_db(
+                                    username=username,
+                                    original_url=image_urls[i],
+                                    user_id=user_id,
+                                    image_data=result
+                                )
+                                if db_saved:
+                                    saved_to_db_count += 1
         
         # 성공한 다운로드 수 계산
         success_count = sum(1 for img in downloaded_images if img.get("status") == "success")
         
         # 응답 텍스트 생성
         response_text = format_request_summary(data, success_count, len(image_urls))
+        if saved_to_db_count > 0:
+            response_text += f"\nDB 저장: {saved_to_db_count}개 완료"
         
-        logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {success_count}/{len(image_urls)}개")
+        logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {success_count}/{len(image_urls)}개, DB저장: {saved_to_db_count}개")
         
         # 카카오톡 표준 응답 형식으로 반환
         return {
@@ -378,12 +476,16 @@ async def process_kakao_request(request: Request):
 @app.get("/health")
 async def health_check():
     """헬스체크"""
+    # DB 연결 상태 확인
+    db_status = "connected" if db_pool else "disconnected"
+    
     return JSONResponse({
         "status": "healthy",
         "timestamp": get_kst_datetime().isoformat(),
         "kakao_image_dir": str(KAKAO_IMAGE_DIR),
         "max_file_size_mb": MAX_FILE_SIZE // (1024*1024),
-        "allowed_extensions": list(ALLOWED_EXTENSIONS)
+        "allowed_extensions": list(ALLOWED_EXTENSIONS),
+        "database_status": db_status
     })
 
 @app.get("/")
