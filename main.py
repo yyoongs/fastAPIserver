@@ -192,8 +192,9 @@ def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
 async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id: str, username: str) -> Dict[str, Any]:
     """카카오톡 이미지 다운로드 및 저장"""
     try:
-        logger.info(f"🌐 이미지 다운로드 시작: {url}...")
-        
+        # URL 길이에 관계없이 전체 표시
+        logger.info(f"🌐 이미지 다운로드 시작 - 사용자: {username} ({user_id})")
+        logger.info(f"📍 다운로드 URL: {url}")        
         # 이미지 다운로드
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status != 200:
