@@ -192,7 +192,7 @@ def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
 async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id: str, username: str) -> Dict[str, Any]:
     """카카오톡 이미지 다운로드 및 저장"""
     try:
-        logger.info(f"🌐 이미지 다운로드 시작: {url[:500]}...")
+        logger.info(f"🌐 이미지 다운로드 시작: {url}...")
         
         # 이미지 다운로드
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
