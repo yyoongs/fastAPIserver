@@ -1,4 +1,3 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
@@ -14,6 +13,8 @@ import sys
 import zipfile
 import io
 import json
+import re
+import aiohttp
 from typing import Dict, Any, Optional
 
 # 로깅 설정 강화
@@ -44,13 +45,16 @@ app.add_middleware(
 
 # 설정
 UPLOAD_DIR = Path("uploads")
+KAKAO_IMAGE_DIR = Path("/Authfiles/kakao_images")  # 마운트된 디스크 경로
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_CONCURRENT_UPLOADS = 1000  # 동시 업로드 제한
 
 # 업로드 디렉토리 생성
 UPLOAD_DIR.mkdir(exist_ok=True)
+KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)  # 카카오 이미지 디렉토리 생성
 logger.info(f"업로드 디렉토리 생성/확인 완료: {UPLOAD_DIR.absolute()}")
+logger.info(f"카카오 이미지 디렉토리 생성/확인 완료: {KAKAO_IMAGE_DIR.absolute()}")
 
 # 세마포어로 동시 업로드 수 제한
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
@@ -108,6 +112,102 @@ async def save_image_async(file_content: bytes, filename: str) -> str:
     except Exception as e:
         logger.error(f"파일 저장 실패 {filename}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {str(e)}")
+
+def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
+    """카카오톡 데이터에서 이미지 URL들 추출"""
+    urls = []
+    
+    try:
+        # detailParams에서 secureUrls 추출
+        detail_params = data.get("action", {}).get("detailParams", {})
+        
+        # secureUrls가 문자열로 되어 있는 경우 (예: "List(http://...)")
+        secure_urls_str = detail_params.get("secureUrls", "")
+        if secure_urls_str:
+            # URL 패턴으로 추출
+            url_pattern = r'https?://[^\s,)\]"]+'
+            found_urls = re.findall(url_pattern, secure_urls_str)
+            urls.extend(found_urls)
+        
+        # 다른 가능한 위치에서도 URL 찾기
+        for key, value in detail_params.items():
+            if isinstance(value, str) and ("http" in value):
+                found_urls = re.findall(r'https?://[^\s,)\]"]+', value)
+                urls.extend(found_urls)
+        
+        # 중복 제거
+        urls = list(set(urls))
+        
+    except Exception as e:
+        logger.error(f"URL 추출 실패: {str(e)}")
+    
+    return urls
+
+async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id: str, username: str) -> Dict[str, Any]:
+    """카카오톡 이미지 다운로드 및 저장"""
+    try:
+        logger.info(f"🌐 이미지 다운로드 시작: {url[:100]}...")
+        
+        # 이미지 다운로드
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                logger.error(f"❌ 이미지 다운로드 실패: HTTP {response.status}")
+                return {"status": "error", "error": f"HTTP {response.status}"}
+            
+            # Content-Type 확인
+            content_type = response.headers.get('content-type', '')
+            if not content_type.startswith('image/'):
+                logger.error(f"❌ 이미지가 아닌 파일: {content_type}")
+                return {"status": "error", "error": f"Invalid content type: {content_type}"}
+            
+            # 이미지 데이터 읽기
+            image_data = await response.read()
+            
+            if len(image_data) == 0:
+                logger.error("❌ 빈 이미지 파일")
+                return {"status": "error", "error": "Empty image file"}
+            
+            if len(image_data) > MAX_FILE_SIZE:
+                logger.error(f"❌ 파일 크기 초과: {len(image_data):,} bytes")
+                return {"status": "error", "error": f"File too large: {len(image_data):,} bytes"}
+        
+        # 파일명 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        
+        # 확장자 결정 (Content-Type 기반)
+        extension = ".jpg"  # 기본값
+        if "png" in content_type:
+            extension = ".png"
+        elif "gif" in content_type:
+            extension = ".gif"
+        elif "webp" in content_type:
+            extension = ".webp"
+        
+        filename = f"kakao_{user_id[:8]}_{timestamp}_{unique_id}{extension}"
+        file_path = KAKAO_IMAGE_DIR / filename
+        
+        # 파일 저장
+        async with aiofiles.open(file_path, 'wb') as f:
+            await f.write(image_data)
+        
+        logger.info(f"✅ 이미지 저장 완료: {filename} ({len(image_data):,} bytes)")
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "file_path": str(file_path),
+            "file_size": len(image_data),
+            "content_type": content_type,
+            "original_url": url
+        }
+        
+    except asyncio.TimeoutError:
+        logger.error("❌ 이미지 다운로드 타임아웃")
+        return {"status": "error", "error": "Download timeout"}
+    except Exception as e:
+        logger.error(f"❌ 이미지 다운로드 실패: {str(e)}")
+        return {"status": "error", "error": str(e)}
 
 @app.on_event("startup")
 async def startup_event():
@@ -308,7 +408,7 @@ async def download_all_files():
 
 @app.post("/kakao/chat")
 async def process_kakao_request(request: Request):
-    """카카오톡 챗봇 요청 처리 및 정리"""
+    """카카오톡 챗봇 요청 처리 및 이미지 저장"""
     try:
         # JSON 데이터 받기
         data = await request.json()
@@ -332,19 +432,46 @@ async def process_kakao_request(request: Request):
         bot = data["bot"]
         action = data["action"]
         
-        # 사용자 발화 내용 기반으로 응답 생성
+        # 사용자 정보
         user_message = user_request["utterance"]
         user_id = user_request["user"]["id"]
         user_type = user_request["user"]["type"]
         user_properties = user_request["user"].get("properties", {})
-        bot_name = bot["name"]
-        intent_name = intent["name"]
-        block_name = user_request["block"]["name"]
-        timezone = user_request["timezone"]
-        request_params = user_request.get("params", {})
-        action_name = action["name"]
+        username = user_properties.get("username", "Unknown")
         
-        # 전달받은 요청 전체를 텍스트로 변환
+        # 이미지 URL 추출 및 다운로드
+        image_urls = extract_image_urls_from_kakao_data(data)
+        downloaded_images = []
+        
+        if image_urls:
+            logger.info(f"🖼️ 발견된 이미지 URL: {len(image_urls)}개")
+            
+            # 비동기 HTTP 세션으로 이미지 다운로드
+            async with aiohttp.ClientSession() as session:
+                download_tasks = []
+                for url in image_urls:
+                    task = download_kakao_image(session, url, user_id, username)
+                    download_tasks.append(task)
+                
+                # 모든 다운로드 작업 동시 실행
+                if download_tasks:
+                    results = await asyncio.gather(*download_tasks, return_exceptions=True)
+                    
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(f"❌ 이미지 {i+1} 다운로드 예외: {str(result)}")
+                            downloaded_images.append({
+                                "status": "error", 
+                                "error": str(result),
+                                "url": image_urls[i] if i < len(image_urls) else "unknown"
+                            })
+                        else:
+                            downloaded_images.append(result)
+        
+        # 성공한 다운로드 수 계산
+        success_count = sum(1 for img in downloaded_images if img.get("status") == "success")
+        
+        # 전달받은 요청 정보를 텍스트로 변환
         request_text = f"""📋 전달받은 요청 전체:
 
 🎯 Intent (의도):
@@ -373,6 +500,7 @@ async def process_kakao_request(request: Request):
             request_text += "\n- Properties: 없음"
 
         # 요청 파라미터 추가
+        request_params = user_request.get("params", {})
         request_text += f"\n\n⚙️ Request Params:"
         if request_params:
             for key, value in request_params.items():
@@ -406,9 +534,27 @@ async def process_kakao_request(request: Request):
         request_text += f"\n- Detail Params:"
         if detail_params:
             for key, value in detail_params.items():
-                request_text += f"\n  • {key}: {value}"
+                if len(str(value)) > 100:  # 긴 값은 축약
+                    request_text += f"\n  • {key}: {str(value)[:100]}..."
+                else:
+                    request_text += f"\n  • {key}: {value}"
         else:
             request_text += " 없음"
+
+        # 이미지 처리 결과 추가
+        if image_urls:
+            request_text += f"""
+
+🖼️ 이미지 처리 결과:
+- 발견된 이미지 URL: {len(image_urls)}개
+- 다운로드 성공: {success_count}개
+- 저장 위치: {KAKAO_IMAGE_DIR}"""
+            
+            for i, img_result in enumerate(downloaded_images, 1):
+                if img_result.get("status") == "success":
+                    request_text += f"\n  ✅ 이미지 {i}: {img_result['filename']} ({img_result['file_size']:,} bytes)"
+                else:
+                    request_text += f"\n  ❌ 이미지 {i}: {img_result.get('error', 'Unknown error')}"
 
         # 처리 정보 추가
         request_text += f"""
@@ -416,15 +562,25 @@ async def process_kakao_request(request: Request):
 ⏰ 처리 정보:
 - 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - 서버 상태: 정상 동작 중
+- 이미지 저장 경로: {KAKAO_IMAGE_DIR}
 
 ✅ 모든 정보가 성공적으로 수신되었습니다."""
         
-        # 최종 응답 텍스트 (간단 요약 + 전체 요청 정보)
-        response_text = f"""안녕하세요! '{user_message}' 메시지를 잘 받았습니다.
+        # 최종 응답 텍스트
+        if image_urls and success_count > 0:
+            response_text = f"""안녕하세요! '{user_message}' 메시지와 함께 {success_count}개의 이미지를 성공적으로 저장했습니다.
+
+{request_text}"""
+        elif image_urls and success_count == 0:
+            response_text = f"""안녕하세요! '{user_message}' 메시지를 받았지만, {len(image_urls)}개의 이미지 저장에 실패했습니다.
+
+{request_text}"""
+        else:
+            response_text = f"""안녕하세요! '{user_message}' 메시지를 잘 받았습니다.
 
 {request_text}"""
         
-        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {user_id} ({user_type}), 발화: '{user_message[:50]}...', 속성: {len(user_properties)}개")
+        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {user_id} ({user_type}), 발화: '{user_message[:50]}...', 이미지: {success_count}/{len(image_urls)}개 저장")
         
         # 카카오톡 표준 응답 형식으로 반환
         return {
