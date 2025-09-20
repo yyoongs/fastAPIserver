@@ -13,7 +13,7 @@ import mimetypes
 import sys
 import zipfile
 import io
-from pydantic import BaseModel
+from typing import Dict, Any, Optional
 
 # 로깅 설정 강화
 logging.basicConfig(
@@ -55,44 +55,34 @@ logger.info(f"업로드 디렉토리 생성/확인 완료: {UPLOAD_DIR.absolute(
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 logger.info(f"동시 업로드 제한 설정: {MAX_CONCURRENT_UPLOADS}개")
 
-# 카카오톡 챗봇 요청 데이터 모델
-class Intent(BaseModel):
-    id: str
-    name: str
-
-class Block(BaseModel):
-    id: str
-    name: str
-
-class User(BaseModel):
-    id: str
-    type: str
-    properties: Dict[str, Any] = {}
-
-class UserRequest(BaseModel):
-    timezone: str
-    params: Dict[str, Any] = {}
-    block: Block
-    utterance: str
-    lang: Optional[str] = None
-    user: User
-
-class Bot(BaseModel):
-    id: str
-    name: str
-
-class Action(BaseModel):
-    name: str
-    clientExtra: Optional[str] = None
-    params: Dict[str, Any] = {}
-    id: str
-    detailParams: Dict[str, Any] = {}
-
-class KakaoRequest(BaseModel):
-    intent: Intent
-    userRequest: UserRequest
-    bot: Bot
-    action: Action
+def validate_kakao_request(data: Dict[Any, Any]) -> bool:
+    """카카오톡 요청 데이터 유효성 검사"""
+    required_fields = [
+        ("intent", ["id", "name"]),
+        ("userRequest", ["timezone", "block", "utterance", "user"]),
+        ("bot", ["id", "name"]),
+        ("action", ["name", "id"])
+    ]
+    
+    try:
+        for field, sub_fields in required_fields:
+            if field not in data:
+                return False
+            
+            for sub_field in sub_fields:
+                if sub_field not in data[field]:
+                    return False
+        
+        # 중요한 중첩 필드들 검사
+        user_request = data["userRequest"]
+        if "id" not in user_request["user"] or "type" not in user_request["user"]:
+            return False
+        if "id" not in user_request["block"] or "name" not in user_request["block"]:
+            return False
+            
+        return True
+    except (KeyError, TypeError):
+        return False
 
 def is_valid_image_type(filename: str) -> bool:
     """파일 확장자 검증"""
@@ -357,56 +347,68 @@ async def root():
     })
 
 @app.post("/kakao/chat")
-async def process_kakao_request(request: KakaoRequest):
+async def process_kakao_request(request: Request):
     """카카오톡 챗봇 요청 처리 및 정리"""
-    logger.info(f"💬 카카오톡 챗봇 요청 수신: {request.userRequest.utterance}")
-    
     try:
+        # JSON 데이터 받기
+        data = await request.json()
+        logger.info(f"💬 카카오톡 챗봇 요청 수신: {data.get('userRequest', {}).get('utterance', 'N/A')}")
+        
+        # 데이터 유효성 검사
+        if not validate_kakao_request(data):
+            logger.warning("❌ 잘못된 카카오톡 요청 형식")
+            raise HTTPException(status_code=400, detail="잘못된 요청 형식입니다. 카카오톡 챗봇 표준 형식을 확인해주세요.")
+        
         # 요청 데이터 정리
+        intent = data["intent"]
+        user_request = data["userRequest"]
+        bot = data["bot"]
+        action = data["action"]
+        
         processed_data = {
             "request_time": datetime.now().isoformat(),
             "summary": {
-                "user_message": request.userRequest.utterance,
-                "user_id": request.userRequest.user.id,
-                "bot_name": request.bot.name,
-                "intent_name": request.intent.name,
-                "block_name": request.userRequest.block.name,
-                "timezone": request.userRequest.timezone
+                "user_message": user_request["utterance"],
+                "user_id": user_request["user"]["id"],
+                "bot_name": bot["name"],
+                "intent_name": intent["name"],
+                "block_name": user_request["block"]["name"],
+                "timezone": user_request["timezone"]
             },
             "detailed_info": {
                 "intent": {
-                    "id": request.intent.id,
-                    "name": request.intent.name
+                    "id": intent["id"],
+                    "name": intent["name"]
                 },
                 "user": {
-                    "id": request.userRequest.user.id,
-                    "type": request.userRequest.user.type,
-                    "properties": request.userRequest.user.properties
+                    "id": user_request["user"]["id"],
+                    "type": user_request["user"]["type"],
+                    "properties": user_request["user"].get("properties", {})
                 },
                 "bot": {
-                    "id": request.bot.id,
-                    "name": request.bot.name
+                    "id": bot["id"],
+                    "name": bot["name"]
                 },
                 "action": {
-                    "id": request.action.id,
-                    "name": request.action.name,
-                    "params": request.action.params,
-                    "detail_params": request.action.detailParams,
-                    "client_extra": request.action.clientExtra
+                    "id": action["id"],
+                    "name": action["name"],
+                    "params": action.get("params", {}),
+                    "detail_params": action.get("detailParams", {}),
+                    "client_extra": action.get("clientExtra")
                 },
-                "request_params": request.userRequest.params,
-                "language": request.userRequest.lang
+                "request_params": user_request.get("params", {}),
+                "language": user_request.get("lang")
             },
             "analysis": {
-                "is_ignore_request": request.userRequest.params.get("ignoreMe") == "true",
-                "has_parameters": len(request.userRequest.params) > 0,
-                "has_user_properties": len(request.userRequest.user.properties) > 0,
-                "utterance_length": len(request.userRequest.utterance),
-                "timezone_region": request.userRequest.timezone.split("/")[-1] if "/" in request.userRequest.timezone else request.userRequest.timezone
+                "is_ignore_request": user_request.get("params", {}).get("ignoreMe") == "true",
+                "has_parameters": len(user_request.get("params", {})) > 0,
+                "has_user_properties": len(user_request["user"].get("properties", {})) > 0,
+                "utterance_length": len(user_request["utterance"]),
+                "timezone_region": user_request["timezone"].split("/")[-1] if "/" in user_request["timezone"] else user_request["timezone"]
             }
         }
         
-        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {request.userRequest.user.id}, 발화: '{request.userRequest.utterance[:50]}...'")
+        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {user_request['user']['id']}, 발화: '{user_request['utterance'][:50]}...'")
         
         # 응답 데이터 (실제 카카오톡 챗봇에서 사용할 형태)
         response_data = {
@@ -415,7 +417,7 @@ async def process_kakao_request(request: KakaoRequest):
                 "outputs": [
                     {
                         "simpleText": {
-                            "text": f"안녕하세요! '{request.userRequest.utterance}' 메시지를 잘 받았습니다.\n\n📊 요청 정보:\n- 사용자 ID: {request.userRequest.user.id}\n- 봇 이름: {request.bot.name}\n- 시간대: {request.userRequest.timezone}\n- 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            "text": f"안녕하세요! '{user_request['utterance']}' 메시지를 잘 받았습니다.\n\n📊 요청 정보:\n- 사용자 ID: {user_request['user']['id']}\n- 봇 이름: {bot['name']}\n- 시간대: {user_request['timezone']}\n- 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         }
                     }
                 ]
