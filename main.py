@@ -1,5 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 import asyncio
@@ -8,9 +8,12 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 import logging
-from typing import List
+from typing import List, Optional, Dict, Any
 import mimetypes
 import sys
+import zipfile
+import io
+from pydantic import BaseModel
 
 # 로깅 설정 강화
 logging.basicConfig(
@@ -51,6 +54,45 @@ logger.info(f"업로드 디렉토리 생성/확인 완료: {UPLOAD_DIR.absolute(
 # 세마포어로 동시 업로드 수 제한
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 logger.info(f"동시 업로드 제한 설정: {MAX_CONCURRENT_UPLOADS}개")
+
+# 카카오톡 챗봇 요청 데이터 모델
+class Intent(BaseModel):
+    id: str
+    name: str
+
+class Block(BaseModel):
+    id: str
+    name: str
+
+class User(BaseModel):
+    id: str
+    type: str
+    properties: Dict[str, Any] = {}
+
+class UserRequest(BaseModel):
+    timezone: str
+    params: Dict[str, Any] = {}
+    block: Block
+    utterance: str
+    lang: Optional[str] = None
+    user: User
+
+class Bot(BaseModel):
+    id: str
+    name: str
+
+class Action(BaseModel):
+    name: str
+    clientExtra: Optional[str] = None
+    params: Dict[str, Any] = {}
+    id: str
+    detailParams: Dict[str, Any] = {}
+
+class KakaoRequest(BaseModel):
+    intent: Intent
+    userRequest: UserRequest
+    bot: Bot
+    action: Action
 
 def is_valid_image_type(filename: str) -> bool:
     """파일 확장자 검증"""
@@ -308,9 +350,191 @@ async def root():
             "multiple_upload": "/upload/multiple",
             "list_files": "/files",
             "delete_file": "/files/{filename}",
+            "download_all": "/download/all",
+            "kakao_chat": "/kakao/chat",
             "health_check": "/health"
         }
     })
+
+@app.post("/kakao/chat")
+async def process_kakao_request(request: KakaoRequest):
+    """카카오톡 챗봇 요청 처리 및 정리"""
+    logger.info(f"💬 카카오톡 챗봇 요청 수신: {request.userRequest.utterance}")
+    
+    try:
+        # 요청 데이터 정리
+        processed_data = {
+            "request_time": datetime.now().isoformat(),
+            "summary": {
+                "user_message": request.userRequest.utterance,
+                "user_id": request.userRequest.user.id,
+                "bot_name": request.bot.name,
+                "intent_name": request.intent.name,
+                "block_name": request.userRequest.block.name,
+                "timezone": request.userRequest.timezone
+            },
+            "detailed_info": {
+                "intent": {
+                    "id": request.intent.id,
+                    "name": request.intent.name
+                },
+                "user": {
+                    "id": request.userRequest.user.id,
+                    "type": request.userRequest.user.type,
+                    "properties": request.userRequest.user.properties
+                },
+                "bot": {
+                    "id": request.bot.id,
+                    "name": request.bot.name
+                },
+                "action": {
+                    "id": request.action.id,
+                    "name": request.action.name,
+                    "params": request.action.params,
+                    "detail_params": request.action.detailParams,
+                    "client_extra": request.action.clientExtra
+                },
+                "request_params": request.userRequest.params,
+                "language": request.userRequest.lang
+            },
+            "analysis": {
+                "is_ignore_request": request.userRequest.params.get("ignoreMe") == "true",
+                "has_parameters": len(request.userRequest.params) > 0,
+                "has_user_properties": len(request.userRequest.user.properties) > 0,
+                "utterance_length": len(request.userRequest.utterance),
+                "timezone_region": request.userRequest.timezone.split("/")[-1] if "/" in request.userRequest.timezone else request.userRequest.timezone
+            }
+        }
+        
+        logger.info(f"✅ 카카오톡 요청 처리 완료 - 사용자: {request.userRequest.user.id}, 발화: '{request.userRequest.utterance[:50]}...'")
+        
+        # 응답 데이터 (실제 카카오톡 챗봇에서 사용할 형태)
+        response_data = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": f"안녕하세요! '{request.userRequest.utterance}' 메시지를 잘 받았습니다.\n\n📊 요청 정보:\n- 사용자 ID: {request.userRequest.user.id}\n- 봇 이름: {request.bot.name}\n- 시간대: {request.userRequest.timezone}\n- 처리 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        }
+                    }
+                ]
+            }
+        }
+        
+        return JSONResponse({
+            "status": "success",
+            "message": "카카오톡 챗봇 요청 처리 완료",
+            "processed_data": processed_data,
+            "kakao_response": response_data
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 카카오톡 요청 처리 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"카카오톡 요청 처리 실패: {str(e)}")
+
+@app.get("/download/all")
+async def download_all_files():
+    """업로드된 모든 파일을 ZIP으로 다운로드"""
+    logger.info("📦 전체 파일 다운로드 요청")
+    
+    try:
+        # 업로드된 파일 목록 확인
+        files = []
+        for file_path in UPLOAD_DIR.glob("*"):
+            if file_path.is_file():
+                files.append(file_path)
+        
+        if not files:
+            logger.warning("❌ 다운로드할 파일이 없음")
+            raise HTTPException(status_code=404, detail="다운로드할 파일이 없습니다")
+        
+        logger.info(f"📊 압축할 파일 수: {len(files)}개")
+        
+        # ZIP 파일을 메모리에 생성
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in files:
+                # ZIP에 파일 추가
+                zip_file.write(file_path, file_path.name)
+                logger.info(f"📁 압축 추가: {file_path.name}")
+        
+        zip_buffer.seek(0)
+        
+        # 현재 시간으로 ZIP 파일명 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"uploaded_files_{timestamp}.zip"
+        
+        logger.info(f"✅ ZIP 파일 생성 완료: {filename} ({len(files)}개 파일)")
+        
+        # 스트리밍 응답으로 ZIP 파일 전송
+        def generate_zip():
+            yield zip_buffer.read()
+        
+        return StreamingResponse(
+            io.BytesIO(zip_buffer.getvalue()),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 전체 파일 다운로드 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"파일 다운로드 실패: {str(e)}")
+
+@app.get("/download/info")
+async def download_info():
+    """다운로드 가능한 파일 정보"""
+    logger.info("📋 다운로드 정보 요청")
+    
+    try:
+        files = []
+        total_size = 0
+        
+        for file_path in UPLOAD_DIR.glob("*"):
+            if file_path.is_file():
+                stat = file_path.stat()
+                file_size = stat.st_size
+                total_size += file_size
+                
+                files.append({
+                    "filename": file_path.name,
+                    "size": file_size,
+                    "size_mb": round(file_size / (1024 * 1024), 2),
+                    "created_time": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                    "extension": file_path.suffix.lower()
+                })
+        
+        # 파일 타입별 통계
+        extensions = {}
+        for file_info in files:
+            ext = file_info["extension"]
+            if ext not in extensions:
+                extensions[ext] = {"count": 0, "total_size": 0}
+            extensions[ext]["count"] += 1
+            extensions[ext]["total_size"] += file_info["size"]
+        
+        return JSONResponse({
+            "status": "success",
+            "download_info": {
+                "total_files": len(files),
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "file_types": {
+                    ext: {
+                        "count": info["count"],
+                        "total_size_mb": round(info["total_size"] / (1024 * 1024), 2)
+                    }
+                    for ext, info in extensions.items()
+                },
+                "estimated_zip_name": f"uploaded_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            },
+            "files": files
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 다운로드 정보 조회 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"다운로드 정보 조회 실패: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
@@ -330,10 +554,13 @@ if __name__ == "__main__":
     print("   - 헬스체크: http://localhost:8000/health")
     print("=" * 70)
     print("📖 주요 엔드포인트:")
-    print("   - POST /upload/single    : 단일 파일 업로드")
-    print("   - POST /upload/multiple  : 다중 파일 업로드")
-    print("   - GET  /files           : 업로드된 파일 목록")
-    print("   - DELETE /files/{name}   : 파일 삭제")
+    print("   - POST /upload/single      : 단일 파일 업로드")
+    print("   - POST /upload/multiple    : 다중 파일 업로드")
+    print("   - GET  /files             : 업로드된 파일 목록")
+    print("   - DELETE /files/{name}     : 파일 삭제")
+    print("   - GET  /download/all       : 모든 파일 ZIP 다운로드")
+    print("   - GET  /download/info      : 다운로드 정보")
+    print("   - POST /kakao/chat         : 카카오톡 챗봇 요청 처리")
     print("=" * 70)
     print("⚠️  서버를 중지하려면 Ctrl+C를 누르세요")
     print("=" * 70)
