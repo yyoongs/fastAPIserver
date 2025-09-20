@@ -317,21 +317,16 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
 
 def format_request_summary(data: Dict[Any, Any], success_count: int, total_images: int) -> str:
     """요청 정보를 요약 형태로 포맷팅"""
-    intent = data["intent"]
-    user_request = data["userRequest"]
-    action = data["action"]
-    user_properties = user_request["user"].get("properties", {})
-    username = user_properties.get("username", "Unknown")
-    
+    action_params = data.get("action", {}).get("params", {})
+    username = action_params.get("username", "Unknown")
     summary = f"""요청 처리 완료
 
-사용자: {username}
-메시지: "{user_request['utterance']}"
+사용자: 👤{username}
 처리 시간: {get_kst_time()}"""
 
     if total_images > 0:
         summary += f"""
-이미지 처리: {success_count}/{total_images}개 성공"""
+✅ 이미지 처리: {success_count}/{total_images}개 성공"""
     
     return summary
 
@@ -383,7 +378,6 @@ async def process_kakao_request(request: Request):
         user_request = data["userRequest"]
         user_message = user_request["utterance"]
         user_id = user_request["user"]["id"]
-        user_type = user_request["user"]["type"]
         
         # action params에서 username 추출
         action_params = data.get("action", {}).get("params", {})
@@ -438,7 +432,7 @@ async def process_kakao_request(request: Request):
         # 응답 텍스트 생성
         response_text = format_request_summary(data, success_count, len(image_urls))
         if saved_to_db_count > 0:
-            response_text += f"\nDB 저장: {saved_to_db_count}개 완료"
+            response_text += f"\n💾 DB 저장: {saved_to_db_count}개 완료"
         
         logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {success_count}/{len(image_urls)}개, DB저장: {saved_to_db_count}개")
         
