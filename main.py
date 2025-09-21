@@ -86,8 +86,22 @@ db_pool: Optional[AsyncConnectionPool] = None
 image_counter: Dict[str, int] = {}  # 동일 사용자의 이미지 카운터
 
 # 디렉토리 생성
-KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+# /src 폴더의 상위에 Authfiles 생성 (날짜별 구조)
+BASE_AUTH_DIR = Path("../Authfiles")  # src 폴더에서 상위로 이동
+KAKAO_IMAGE_DIR = BASE_AUTH_DIR / "kakao_images"
+# KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"카카오 이미지 디렉토리 확인: {KAKAO_IMAGE_DIR.absolute()}")
+
+# Authfiles 디렉토리 생성 (권한 체크)
+try:
+    BASE_AUTH_DIR.mkdir(parents=True, exist_ok=True)
+    KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"업로드 디렉토리 생성/확인 완료: {UPLOAD_DIR.absolute()}")
+    logger.info(f"카카오 이미지 디렉토리 생성/확인 완료: {KAKAO_IMAGE_DIR.absolute()}")
+except PermissionError:
+    logger.warning(f"Authfiles 디렉토리 생성 권한 없음.")
+except Exception as e:
+    logger.error(f"디렉토리 생성 실패: {e}")
 
 # 동시 업로드 제한
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
