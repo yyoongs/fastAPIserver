@@ -342,6 +342,7 @@ def format_request_summary(data: Dict[Any, Any], success_count: int, total_image
     serial_number = user_id[:8]
 
     summary = f"""보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다. ({get_kst_date()})
+
 고유번호는 [{serial_number}]입니다. 
 (2025.09.22부터 신 고유번호 배정중)
 
