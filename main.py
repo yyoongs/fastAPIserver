@@ -38,7 +38,7 @@ class QueueTask:
 
 # 큐 시스템 설정
 DB_WRITE_QUEUE = Queue(maxsize=10000)  # 최대 10,000개 작업 대기
-QUEUE_WORKERS = 10  # DB 쓰기 워커 수
+QUEUE_WORKERS = 5  # DB 쓰기 워커 수
 BATCH_SIZE = 10    # 배치 처리 크기
 BATCH_TIMEOUT = 2.0  # 배치 대기 시간 (초)
 
@@ -146,14 +146,20 @@ async def process_batch(worker_name: str, batch: list):
     
     logger.info(f"{worker_name}: 배치 처리 완료 ({len(batch)}개 작업)")
 
+# 큐 워커에서 에러 처리 강화
 async def process_single_task(task: QueueTask) -> dict:
     """개별 작업 처리 (실제 DB 저장)"""
+    start_time = time.time()
     try:
+        logger.info(f"작업 시작: {task.task_id} (대기시간: {start_time - task.created_at:.2f}초)")
+        
         # 이미지 다운로드
         downloaded_images = []
         saved_files = []
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
             download_tasks = [
                 download_kakao_image(session, url, task.user_id, task.username) 
                 for url in task.image_urls
@@ -164,9 +170,10 @@ async def process_single_task(task: QueueTask) -> dict:
                 
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
+                        logger.error(f"이미지 다운로드 실패 {i+1}: {str(result)}")
                         downloaded_images.append({
                             "status": "error",
-                            "error": str(result),
+                            "error": str(result)[:100],
                             "url": task.image_urls[i] if i < len(task.image_urls) else "unknown"
                         })
                     else:
@@ -180,14 +187,16 @@ async def process_single_task(task: QueueTask) -> dict:
         # 모든 이미지가 성공하지 않으면 롤백
         if task.image_urls and success_count != len(task.image_urls):
             await cleanup_files(saved_files)
+            logger.warning(f"작업 실패: {task.task_id} - 다운로드 {success_count}/{len(task.image_urls)}")
             return {
                 "success": False,
                 "error": "이미지 다운로드 실패",
                 "success_count": success_count,
-                "total_count": len(task.image_urls)
+                "total_count": len(task.image_urls),
+                "saved_to_db_count": 0
             }
         
-        # DB 저장 (트랜잭션)
+        # DB 저장 (재시도 로직 간소화)
         saved_to_db_count = 0
         if success_count > 0:
             try:
@@ -209,42 +218,50 @@ async def process_single_task(task: QueueTask) -> dict:
                         saved_to_db_count = success_count
                         
             except Exception as db_error:
-                # DB 실패 시 파일 롤백
                 await cleanup_files(saved_files)
                 return {
                     "success": False,
-                    "error": f"DB 저장 실패: {str(db_error)}",
+                    "error": f"DB 저장 실패",
                     "success_count": 0,
-                    "total_count": len(task.image_urls)
+                    "total_count": len(task.image_urls),
+                    "saved_to_db_count": 0
                 }
+        
+        processing_time = time.time() - start_time
         
         return {
             "success": True,
             "success_count": success_count,
             "total_count": len(task.image_urls),
-            "saved_to_db_count": saved_to_db_count
+            "saved_to_db_count": saved_to_db_count,
+            "processing_time": processing_time
         }
         
     except Exception as e:
-        # 예외 발생 시 파일 정리
-        if 'saved_files' in locals():
-            await cleanup_files(saved_files)
-        
+        await cleanup_files(saved_files)
         return {
             "success": False,
-            "error": str(e),
+            "error": str(e)[:100],  # 에러 메시지 길이 제한
             "success_count": 0,
-            "total_count": len(task.image_urls) if task.image_urls else 0
+            "total_count": len(task.image_urls) if task.image_urls else 0,
+            "saved_to_db_count": 0
         }
 
 async def submit_to_queue(user_id: str, username: str, image_urls: list, data: dict) -> dict:
     """작업을 큐에 제출하고 결과 대기"""
     # 큐가 가득 찬 경우 처리
-    if DB_WRITE_QUEUE.qsize() >= DB_WRITE_QUEUE.maxsize - 10:
+    if DB_WRITE_QUEUE.qsize() >= DB_WRITE_QUEUE.maxsize * 0.8:
         logger.warning(f"큐가 거의 가득참: {DB_WRITE_QUEUE.qsize()}/{DB_WRITE_QUEUE.maxsize}")
         return {
             "success": False,
             "error": "서버가 과부하 상태입니다. 잠시 후 다시 시도해주세요."
+        }
+    
+    # 빈 이미지 URL 체크
+    if not image_urls:
+        return {
+            "success": False,
+            "error": "이미지 URL 없음"
         }
     
     # 작업 생성
@@ -316,10 +333,10 @@ def get_kst_date_folder() -> str:
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',  # 더 간단한 포맷
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('server.log', encoding='utf-8')
+        logging.FileHandler('server.log', encoding='utf-8', maxBytes=50*1024*1024, backupCount=3)  # 로그 로테이션 추가
     ]
 )
 logger = logging.getLogger(__name__)
@@ -376,8 +393,8 @@ async def init_database():
         
         db_pool = AsyncConnectionPool(
             connection_string,
-            min_size=1,
-            max_size=200,
+            min_size=5,
+            max_size=50,
             timeout=30
         )
         logger.info("PostgreSQL 연결 풀 생성 완료")
@@ -603,14 +620,14 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
     except Exception as e:
         logger.error(f"이미지 다운로드 실패: {str(e)}")
         return {"status": "error", "error": str(e)}
-
-def format_request_summary(data: Dict[Any, Any], success_count: int, total_images: int, date_folder: str = None) -> str:
+    
+def format_request_summary_from_result(data: Dict[Any, Any], result: dict) -> str:
     """요청 정보를 요약 형태로 포맷팅"""
     user_request = data["userRequest"]
     user_id = user_request["user"]["id"]
     serial_number = user_id[:8]
 
-    summary = f"""보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다.📩({get_kst_date()})
+    summary = f"""보내주신 인증서({result['total_count']}장)은 정상적으로 접수되었습니다.📩({get_kst_date()})
 
 🔈고유번호는 [{serial_number}]입니다. 
 (2025.09.22부터 신 고유번호 배정중)
@@ -655,17 +672,23 @@ async def shutdown_event():
     
     logger.info("안전하게 종료되었습니다.")
 
-# 큐 상태 모니터링 엔드포인트
+# 큐 상태 모니터링 개선
 @app.get("/queue/status")
 async def queue_status():
     """큐 상태 확인"""
+    queue_size = DB_WRITE_QUEUE.qsize()
+    queue_usage = (queue_size / DB_WRITE_QUEUE.maxsize) * 100
+    
     return JSONResponse({
-        "queue_size": DB_WRITE_QUEUE.qsize(),
+        "queue_size": queue_size,
         "max_queue_size": DB_WRITE_QUEUE.maxsize,
+        "queue_usage_percent": round(queue_usage, 1),
+        "status": "high" if queue_usage > 80 else "medium" if queue_usage > 50 else "normal",
         "workers_running": queue_workers_running,
         "active_workers": len(worker_tasks),
         "batch_size": BATCH_SIZE,
-        "batch_timeout": BATCH_TIMEOUT
+        "batch_timeout": BATCH_TIMEOUT,
+        "db_pool_size": db_pool.get_stats() if db_pool else None
     })
 
 @app.post("/kakao/chat")
@@ -676,10 +699,10 @@ async def process_kakao_request(request: Request):
         data = await request.json()
         
         # 요청 전체를 로그에 출력 (개발/디버깅용)
-        logger.info("="*80)
-        logger.info("카카오톡 요청 데이터:")
-        logger.info(f"{json.dumps(data, indent=2, ensure_ascii=False)}")
-        logger.info("="*80)
+        # logger.info("="*80)
+        # logger.info("카카오톡 요청 데이터:")
+        # logger.info(f"{json.dumps(data, indent=2, ensure_ascii=False)}")
+        # logger.info("="*80)
         
         # 데이터 유효성 검사
         if not validate_kakao_request(data):
@@ -689,74 +712,24 @@ async def process_kakao_request(request: Request):
         # 요청 데이터 파싱
         user_request = data["userRequest"]
         user_id = user_request["user"]["id"]
-
-        # action params에서 username 추출
-        action_params = data.get("action", {}).get("params", {})
-        username = action_params.get("username", "Unknown")
                 
         # 이미지 URL 추출 및 다운로드
         image_urls = extract_image_urls_from_kakao_data(data)
-        downloaded_images = []
-        saved_files = []  # 저장된 파일 경로 리스트 (롤백용)
-        saved_to_db_count = 0
-        date_folder = None
         
-        if image_urls:
-            logger.info(f"발견된 이미지 URL: {len(image_urls)}개")
-            
-            # 비동기 HTTP 세션으로 이미지 다운로드
-            async with aiohttp.ClientSession() as session:
-                download_tasks = [
-                    download_kakao_image(session, url, user_id, username) 
-                    for url in image_urls
-                ]
-                
-                # 모든 다운로드 작업 동시 실행
-                if download_tasks:
-                    results = await asyncio.gather(*download_tasks, return_exceptions=True)
-                    
-                    for i, result in enumerate(results):
-                        if isinstance(result, Exception):
-                            logger.error(f"이미지 {i+1} 다운로드 예외: {str(result)}")
-                            downloaded_images.append({
-                                "status": "error", 
-                                "error": str(result),
-                                "url": image_urls[i] if i < len(image_urls) else "unknown"
-                            })
-                        else:
-                            downloaded_images.append(result)
-                            
-                            # 성공한 이미지 경로 저장
-                            if result.get("status") == "success":
-                                saved_files.append(result.get("file_path"))
-                                if not date_folder:
-                                    date_folder = result.get("date_folder")
-        
-        # 성공한 다운로드 수 계산
-        success_count = sum(1 for img in downloaded_images if img.get("status") == "success")
-        
-        # 모든 이미지가 성공적으로 다운로드되지 않은 경우 롤백
-        if image_urls and success_count != len(image_urls):
-            logger.warning(f"이미지 처리 실패 - 성공: {success_count}/{len(image_urls)}개, 롤백 시작")
-            
-            # 저장된 파일들 삭제 (롤백)
-            await cleanup_files(saved_files)
-            
-            # 실패 응답 반환
+        if not image_urls:
+            logger.warning(f"이미지 없음: {user_id[:8]}")
             return {
                 "version": "2.0",
                 "template": {
-                    "outputs": [
-                        {
-                            "simpleText": {
-                                "text": f"❌ 접속 증가로 오류가 발생하였습니다.\n 잠시후 다시 인증서를 업로드 해주세요."
-                            }
+                    "outputs": [{
+                        "simpleText": {
+                            "text": "이미지가 감지되지 않았습니다. 다시 업로드해주세요."
                         }
-                    ]
+                    }]
                 }
             }
         
-                # 🔥 큐 시스템으로 작업 제출
+        # 🔥 큐 시스템으로 작업 제출
         result = await submit_to_queue(user_id, '', image_urls, data)
         
         if not result["success"]:
@@ -772,67 +745,10 @@ async def process_kakao_request(request: Request):
                 }
             }
         
-        
-        # # 🔥 트랜잭션 방식으로 DB 저장 처리
-        # if success_count > 0:
-        #     try:
-        #         # psycopg 트랜잭션 시작
-        #         async with db_pool.connection() as conn:
-        #             async with conn.transaction():
-        #                 logger.info("DB 트랜잭션 시작")
-                        
-        #                 # 모든 성공한 이미지에 대해 DB 저장 시도
-        #                 db_records = []
-        #                 for i, img in enumerate(downloaded_images):
-        #                     if img.get("status") == "success":
-        #                         # 트랜잭션 내에서 DB 저장
-        #                         db_saved = await save_image_upload_to_db_in_transaction(
-        #                             conn=conn,
-        #                             username='',
-        #                             original_url=image_urls[i],
-        #                             user_id=user_id,
-        #                             image_data=img
-        #                         )
-                                
-        #                         if not db_saved:
-        #                             # DB 저장 실패 시 예외 발생으로 트랜잭션 롤백
-        #                             raise Exception(f"DB 저장 실패: 이미지 {i+1} ({image_urls[i]})")
-                                
-        #                         db_records.append({
-        #                             "index": i,
-        #                             "url": image_urls[i],
-        #                             "file_path": img.get("file_path")
-        #                         })
-                        
-        #                 # 모든 DB 저장이 성공한 경우
-        #                 saved_to_db_count = len(db_records)
-        #                 logger.info(f"DB 트랜잭션 성공: {saved_to_db_count}개 레코드 저장")
-                    
-        #     except Exception as db_error:
-        #         # DB 트랜잭션 실패 시 저장된 모든 파일 삭제
-        #         logger.error(f"DB 트랜잭션 실패: {str(db_error)}")
-        #         logger.warning("파일 롤백 시작 - 저장된 모든 파일 삭제")
-                
-        #         await cleanup_files(saved_files)
-                
-        #         # DB 저장 실패 응답 반환
-        #         return {
-        #             "version": "2.0",
-        #             "template": {
-        #                 "outputs": [
-        #                     {
-        #                         "simpleText": {
-        #                             "text": "❌ 접속 증가로 오류가 발생하였습니다.\n 잠시후 다시 인증서를 업로드 해주세요."
-        #                         }
-        #                     }
-        #                 ]
-        #             }
-        #         }
-        
         # 응답 텍스트 생성
-        response_text = format_request_summary(data, success_count, len(image_urls), date_folder)
+        response_text = format_request_summary_from_result(data, result)
         
-        logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {success_count}/{len(image_urls)}개, DB저장: {saved_to_db_count}개")
+        logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {result['success_count']}/{result['total_count']}개, DB저장: {result['saved_to_db_count']}개")
         
         # 카카오톡 표준 응답 형식으로 반환
         return {
@@ -913,75 +829,6 @@ async def cleanup_files(file_paths: list):
                 logger.info(f"롤백: 파일 삭제 - {file_path}")
         except Exception as e:
             logger.error(f"파일 삭제 실패 - {file_path}: {str(e)}")
-
-# async def save_image_upload_to_db(
-#     username: str,
-#     original_url: str, 
-#     user_id: str,
-#     image_data: Dict[str, Any]
-# ) -> bool:
-#     """이미지 업로드 정보를 데이터베이스에 저장"""
-#     global db_pool
-#     if not db_pool:
-#         logger.error("데이터베이스 연결 풀이 초기화되지 않음")
-#         return False
-    
-#     serial_number = user_id[:8]
-
-#     insert_sql = """
-#     INSERT INTO kakao_image_uploads (
-#         username, serial_number, user_id, original_url, filename, file_path, 
-#         file_size, content_type, upload_time
-#     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-#     """
-    
-#     try:
-#         async with db_pool.connection() as conn:
-#             await conn.execute(
-#                 insert_sql,
-#                 (
-#                     username,
-#                     serial_number,
-#                     user_id,
-#                     original_url,
-#                     image_data["filename"],
-#                     image_data["file_path"],
-#                     image_data["file_size"],
-#                     image_data["content_type"],
-#                     get_kst_time()
-#                 )
-#             )
-#         logger.info(f"DB 저장 완료: {image_data['filename']}")
-#         return True
-#     except Exception as e:
-#         logger.error(f"DB 저장 실패: {str(e)}")
-#         return False
-    
-# # 옵션: 재시도 메커니즘이 포함된 DB 저장 함수
-# async def save_image_upload_to_db_with_retry(username: str, original_url: str, user_id: str, image_data: dict, max_retries: int = 3):
-#     """재시도 메커니즘이 포함된 DB 저장 함수"""
-#     for attempt in range(max_retries):
-#         try:
-#             result = await save_image_upload_to_db(
-#                 username=username,
-#                 original_url=original_url,
-#                 user_id=user_id,
-#                 image_data=image_data
-#             )
-            
-#             if result:
-#                 return True
-#             else:
-#                 logger.warning(f"DB 저장 실패 (시도 {attempt + 1}/{max_retries}): {original_url}")
-#                 if attempt < max_retries - 1:
-#                     await asyncio.sleep(1)  # 1초 대기 후 재시도
-                    
-#         except Exception as e:
-#             logger.error(f"DB 저장 에러 (시도 {attempt + 1}/{max_retries}): {str(e)}")
-#             if attempt < max_retries - 1:
-#                 await asyncio.sleep(1)
-    
-#     return False
 
 @app.get("/health")
 async def health_check():
