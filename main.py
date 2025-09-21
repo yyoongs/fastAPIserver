@@ -17,6 +17,7 @@ from urllib.parse import unquote
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 # 큐 시스템 추가 imports
 import asyncio
@@ -336,7 +337,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',  # 더 간단한 포맷
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('server.log', encoding='utf-8', maxBytes=50*1024*1024, backupCount=3)  # 로그 로테이션 추가
+        RotatingFileHandler('server.log', encoding='utf-8', maxBytes=50*1024*1024, backupCount=3)  # 로그 로테이션 추가
     ]
 )
 logger = logging.getLogger(__name__)
