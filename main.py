@@ -610,17 +610,17 @@ def format_request_summary(data: Dict[Any, Any], success_count: int, total_image
     user_id = user_request["user"]["id"]
     serial_number = user_id[:8]
 
-    summary = f"""보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다. ({get_kst_date()})
+    summary = f"""보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다.📩({get_kst_date()})
 
-고유번호는 [{serial_number}]입니다. 
+🔈고유번호는 [{serial_number}]입니다. 
 (2025.09.22부터 신 고유번호 배정중)
 
-최립우 연습생을 위한 소중한 투표 감사드립니다.
+🐰최립우 연습생🐰을 위한 소중한 투표 감사드립니다.🥰
 
-9월 19, 20, 21일에 배정됐던 구 고유번호(알파벳대문자2+숫자3) 투표도 정상적으로 집계될 예정이니, 걱정하지 않으셔도 됩니다.
-또한 당첨자 발표 후 순차적으로 개별 안내가 발송됩니다.
+✔️9월 19, 20, 21일에 배정됐던 구 고유번호(알파벳대문자2+숫자3) 투표도 정상적으로 집계될 예정이니, 걱정하지 않으셔도 됩니다.
+✔️또한 당첨자 발표 후 순차적으로 개별 안내가 발송됩니다.
 
-이벤트 관련 안내는 공지사항을 통해 업데이트 되니, 많은 관심 부탁드립니다.""" 
+✔️이벤트 관련 안내는 공지사항을 통해 업데이트 되니, 많은 관심 부탁드립니다.""" 
     return summary
 
 @app.on_event("startup")
