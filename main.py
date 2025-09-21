@@ -24,6 +24,11 @@ def get_kst_time() -> str:
     kst = pytz.timezone('Asia/Seoul')
     return datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
 
+def get_kst_date() -> str:
+    """한국 날짜 반환 (문자열)"""
+    kst = pytz.timezone('Asia/Seoul')
+    return datetime.now(kst).strftime('%Y.%m.%d')
+
 def get_kst_timestamp() -> str:
     """한국 시간 타임스탬프 반환 (파일명용)"""
     kst = pytz.timezone('Asia/Seoul')
@@ -86,22 +91,8 @@ db_pool: Optional[AsyncConnectionPool] = None
 image_counter: Dict[str, int] = {}  # 동일 사용자의 이미지 카운터
 
 # 디렉토리 생성
-# /src 폴더의 상위에 Authfiles 생성 (날짜별 구조)
-BASE_AUTH_DIR = Path("../Authfiles")  # src 폴더에서 상위로 이동
-KAKAO_IMAGE_DIR = BASE_AUTH_DIR / "kakao_images"
-# KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"카카오 이미지 디렉토리 확인: {KAKAO_IMAGE_DIR.absolute()}")
-
-# Authfiles 디렉토리 생성 (권한 체크)
-try:
-    BASE_AUTH_DIR.mkdir(parents=True, exist_ok=True)
-    KAKAO_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"업로드 디렉토리 생성/확인 완료: {UPLOAD_DIR.absolute()}")
-    logger.info(f"카카오 이미지 디렉토리 생성/확인 완료: {KAKAO_IMAGE_DIR.absolute()}")
-except PermissionError:
-    logger.warning(f"Authfiles 디렉토리 생성 권한 없음.")
-except Exception as e:
-    logger.error(f"디렉토리 생성 실패: {e}")
 
 # 동시 업로드 제한
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
@@ -145,11 +136,13 @@ async def save_image_upload_to_db(
         logger.error("데이터베이스 연결 풀이 초기화되지 않음")
         return False
     
+    serial_number = user_id[:8]
+
     insert_sql = """
     INSERT INTO kakao_image_uploads (
-        username, original_url, user_id, filename, file_path, 
+        username, serial_number, user_id, original_url, filename, file_path, 
         file_size, content_type, upload_time
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     
     try:
@@ -158,8 +151,9 @@ async def save_image_upload_to_db(
                 insert_sql,
                 (
                     username,
-                    original_url,
+                    serial_number,
                     user_id,
+                    original_url,
                     image_data["filename"],
                     image_data["file_path"],
                     image_data["file_size"],
@@ -204,45 +198,53 @@ def validate_kakao_request(data: Dict[Any, Any]) -> bool:
 
 def generate_unique_filename(username: str, user_id: str, extension: str = ".jpg") -> tuple[str, Path]:
     """
-    고유한 파일명 생성 및 날짜별 폴더 경로 반환
+    고유한 파일명 생성 및 serial_number별 폴더 경로 반환
     Returns: (filename, full_directory_path)
     """
     global image_counter
     
+    # serial_number는 user_id의 앞 8자리
+    serial_number = user_id[:8]
+    
     # 날짜별 폴더 생성 (YYMMDD 형식)
     date_folder = get_kst_date_folder()
-    date_dir = KAKAO_IMAGE_DIR / date_folder
-    date_dir.mkdir(parents=True, exist_ok=True)
+    
+    # serial_number별 폴더 경로: /Authfiles/kakao_images/날짜/serial_number
+    serial_dir = KAKAO_IMAGE_DIR / date_folder / serial_number
+    serial_dir.mkdir(parents=True, exist_ok=True)
     
     # 사용자별 카운터 키 생성
-    counter_key = f"{username}_{user_id}_{date_folder}"
+    counter_key = f"{serial_number}_{date_folder}"
     
     # 카운터 증가
     if counter_key not in image_counter:
         # 해당 폴더의 기존 파일들 확인하여 카운터 초기화
-        existing_files = list(date_dir.glob(f"{username}_{user_id[:8]}_*{extension}"))
+        existing_files = list(serial_dir.glob(f"{serial_number}_*{extension}"))
         if existing_files:
-            # 가장 큰 번호 찾기
-            max_num = 0
+            # 가장 큰 인덱스 번호 찾기
+            max_idx = 0
             for file in existing_files:
                 try:
-                    # 파일명에서 번호 추출 (username_userid_번호.확장자)
+                    # 파일명에서 인덱스 추출 (serial_number_timestamp_idx.확장자)
                     parts = file.stem.split('_')
                     if len(parts) >= 3:
-                        num = int(parts[-1])
-                        max_num = max(max_num, num)
+                        idx = int(parts[-1])  # 마지막 부분이 인덱스
+                        max_idx = max(max_idx, idx)
                 except (ValueError, IndexError):
                     continue
-            image_counter[counter_key] = max_num + 1
+            image_counter[counter_key] = max_idx + 1
         else:
             image_counter[counter_key] = 1
     else:
         image_counter[counter_key] += 1
     
-    # 파일명 생성: username_userid(앞8자리)_번호.확장자
-    filename = f"{username}_{user_id[:8]}_{image_counter[counter_key]}{extension}"
+    # 타임스탬프 생성
+    timestamp = get_kst_timestamp()
     
-    return filename, date_dir
+    # 파일명 생성: serial_number_timestamp_idx.확장자
+    filename = f"{serial_number}_{timestamp}_{image_counter[counter_key]}{extension}"
+    
+    return filename, serial_dir
 
 def extract_image_urls_from_kakao_data(data: Dict[Any, Any]) -> List[str]:
     """카카오톡 데이터에서 이미지 URL들 추출"""
@@ -378,16 +380,24 @@ async def download_kakao_image(session: aiohttp.ClientSession, url: str, user_id
 
 def format_request_summary(data: Dict[Any, Any], success_count: int, total_images: int, date_folder: str = None) -> str:
     """요청 정보를 요약 형태로 포맷팅"""
-    action_params = data.get("action", {}).get("params", {})
-    username = action_params.get("username", "Unknown")
-    summary = f"""요청 처리 완료
+    user_request = data["userRequest"]
+    user_id = user_request["user"]["id"]
+    serial_number = user_id[:8]
 
-사용자: 👤{username}
-처리 시간: {get_kst_time()}"""
+    summary = f"""
 
-    if total_images > 0:
-        summary += f"\n✅ 이미지 처리: {success_count}/{total_images}개 성공"
-    
+보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다. ({get_kst_date()})
+고유번호는 [{serial_number}]입니다. 
+(2025.09.22부터 신 고유번호 배정중)
+
+최립우 연습생을 위한 소중한 투표 감사드립니다.
+
+9월 19, 20, 21일에 배정됐던 구 고유번호(알파벳대문자2+숫자3) 투표도 정상적으로 집계될 예정이니, 걱정하지 않으셔도 됩니다.
+또한 당첨자 발표 후 순차적으로 개별 안내가 발송됩니다.
+
+이벤트 관련 안내는 공지사항을 통해 업데이트 되니, 많은 관심 부탁드립니다.
+
+""" 
     return summary
 
 @app.on_event("startup")
@@ -438,7 +448,7 @@ async def process_kakao_request(request: Request):
         user_request = data["userRequest"]
         user_message = user_request["utterance"]
         user_id = user_request["user"]["id"]
-        
+
         # action params에서 username 추출
         action_params = data.get("action", {}).get("params", {})
         username = action_params.get("username", "Unknown")
@@ -506,7 +516,7 @@ async def process_kakao_request(request: Request):
                     "outputs": [
                         {
                             "simpleText": {
-                                "text": f"❌ 이미지 처리가 실패했습니다. ({success_count}/{len(image_urls)}개)\n 잠시후 다시 시도해주세요."
+                                "text": f"❌ 접속 증가로 오류가 발생하였습니다.\n 잠시후 다시 인증서를 업로드 해주세요."
                             }
                         }
                     ]
@@ -528,8 +538,6 @@ async def process_kakao_request(request: Request):
         
         # 응답 텍스트 생성
         response_text = format_request_summary(data, success_count, len(image_urls), date_folder)
-        if saved_to_db_count > 0:
-            response_text += f"\n💾 DB 저장: {saved_to_db_count}개 완료"
         
         logger.info(f"카카오톡 요청 처리 완료 - 사용자: {user_id}, 이미지: {success_count}/{len(image_urls)}개, DB저장: {saved_to_db_count}개")
         
