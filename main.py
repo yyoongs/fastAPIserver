@@ -384,9 +384,7 @@ def format_request_summary(data: Dict[Any, Any], success_count: int, total_image
     user_id = user_request["user"]["id"]
     serial_number = user_id[:8]
 
-    summary = f"""
-
-보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다. ({get_kst_date()})
+    summary = f"""보내주신 인증서({total_images}장)은 정상적으로 접수되었습니다. ({get_kst_date()})
 고유번호는 [{serial_number}]입니다. 
 (2025.09.22부터 신 고유번호 배정중)
 
@@ -395,9 +393,7 @@ def format_request_summary(data: Dict[Any, Any], success_count: int, total_image
 9월 19, 20, 21일에 배정됐던 구 고유번호(알파벳대문자2+숫자3) 투표도 정상적으로 집계될 예정이니, 걱정하지 않으셔도 됩니다.
 또한 당첨자 발표 후 순차적으로 개별 안내가 발송됩니다.
 
-이벤트 관련 안내는 공지사항을 통해 업데이트 되니, 많은 관심 부탁드립니다.
-
-""" 
+이벤트 관련 안내는 공지사항을 통해 업데이트 되니, 많은 관심 부탁드립니다.""" 
     return summary
 
 @app.on_event("startup")
@@ -455,6 +451,23 @@ async def process_kakao_request(request: Request):
         
         logger.info(f"카카오톡 요청 수신 - 사용자: {username}, 메시지: {user_message}")
         
+        # username이 "인증서 업로드"인 경우 처리
+        if username == "인증서 업로드":
+            logger.info("사용자명이 '인증서 업로드'로 설정됨 - 사용자명 재입력 요청")
+            return {
+                "version": "2.0",
+                "template": {
+                    "outputs": [
+                        {
+                            "simpleText": {
+                                "text": "인증서 업로드 버튼을 누르고, 사용자명을 다시 입력해주세요.(설정한 카카오톡 이름과 동일해야합니다)"
+                            }
+                        }
+                    ]
+                }
+            }
+        
+    
         # 이미지 URL 추출 및 다운로드
         image_urls = extract_image_urls_from_kakao_data(data)
         downloaded_images = []
