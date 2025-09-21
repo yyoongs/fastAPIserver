@@ -501,7 +501,7 @@ async def process_kakao_request(request: Request):
                                 # 트랜잭션 내에서 DB 저장
                                 db_saved = await save_image_upload_to_db_in_transaction(
                                     conn=conn,
-                                    username=username,
+                                    username='',
                                     original_url=image_urls[i],
                                     user_id=user_id,
                                     image_data=img
@@ -627,74 +627,74 @@ async def cleanup_files(file_paths: list):
         except Exception as e:
             logger.error(f"파일 삭제 실패 - {file_path}: {str(e)}")
 
-async def save_image_upload_to_db(
-    username: str,
-    original_url: str, 
-    user_id: str,
-    image_data: Dict[str, Any]
-) -> bool:
-    """이미지 업로드 정보를 데이터베이스에 저장"""
-    global db_pool
-    if not db_pool:
-        logger.error("데이터베이스 연결 풀이 초기화되지 않음")
-        return False
+# async def save_image_upload_to_db(
+#     username: str,
+#     original_url: str, 
+#     user_id: str,
+#     image_data: Dict[str, Any]
+# ) -> bool:
+#     """이미지 업로드 정보를 데이터베이스에 저장"""
+#     global db_pool
+#     if not db_pool:
+#         logger.error("데이터베이스 연결 풀이 초기화되지 않음")
+#         return False
     
-    serial_number = user_id[:8]
+#     serial_number = user_id[:8]
 
-    insert_sql = """
-    INSERT INTO kakao_image_uploads (
-        username, serial_number, user_id, original_url, filename, file_path, 
-        file_size, content_type, upload_time
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
+#     insert_sql = """
+#     INSERT INTO kakao_image_uploads (
+#         username, serial_number, user_id, original_url, filename, file_path, 
+#         file_size, content_type, upload_time
+#     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+#     """
     
-    try:
-        async with db_pool.connection() as conn:
-            await conn.execute(
-                insert_sql,
-                (
-                    username,
-                    serial_number,
-                    user_id,
-                    original_url,
-                    image_data["filename"],
-                    image_data["file_path"],
-                    image_data["file_size"],
-                    image_data["content_type"],
-                    get_kst_time()
-                )
-            )
-        logger.info(f"DB 저장 완료: {image_data['filename']}")
-        return True
-    except Exception as e:
-        logger.error(f"DB 저장 실패: {str(e)}")
-        return False
+#     try:
+#         async with db_pool.connection() as conn:
+#             await conn.execute(
+#                 insert_sql,
+#                 (
+#                     username,
+#                     serial_number,
+#                     user_id,
+#                     original_url,
+#                     image_data["filename"],
+#                     image_data["file_path"],
+#                     image_data["file_size"],
+#                     image_data["content_type"],
+#                     get_kst_time()
+#                 )
+#             )
+#         logger.info(f"DB 저장 완료: {image_data['filename']}")
+#         return True
+#     except Exception as e:
+#         logger.error(f"DB 저장 실패: {str(e)}")
+#         return False
     
-# 옵션: 재시도 메커니즘이 포함된 DB 저장 함수
-async def save_image_upload_to_db_with_retry(username: str, original_url: str, user_id: str, image_data: dict, max_retries: int = 3):
-    """재시도 메커니즘이 포함된 DB 저장 함수"""
-    for attempt in range(max_retries):
-        try:
-            result = await save_image_upload_to_db(
-                username=username,
-                original_url=original_url,
-                user_id=user_id,
-                image_data=image_data
-            )
+# # 옵션: 재시도 메커니즘이 포함된 DB 저장 함수
+# async def save_image_upload_to_db_with_retry(username: str, original_url: str, user_id: str, image_data: dict, max_retries: int = 3):
+#     """재시도 메커니즘이 포함된 DB 저장 함수"""
+#     for attempt in range(max_retries):
+#         try:
+#             result = await save_image_upload_to_db(
+#                 username=username,
+#                 original_url=original_url,
+#                 user_id=user_id,
+#                 image_data=image_data
+#             )
             
-            if result:
-                return True
-            else:
-                logger.warning(f"DB 저장 실패 (시도 {attempt + 1}/{max_retries}): {original_url}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)  # 1초 대기 후 재시도
+#             if result:
+#                 return True
+#             else:
+#                 logger.warning(f"DB 저장 실패 (시도 {attempt + 1}/{max_retries}): {original_url}")
+#                 if attempt < max_retries - 1:
+#                     await asyncio.sleep(1)  # 1초 대기 후 재시도
                     
-        except Exception as e:
-            logger.error(f"DB 저장 에러 (시도 {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
+#         except Exception as e:
+#             logger.error(f"DB 저장 에러 (시도 {attempt + 1}/{max_retries}): {str(e)}")
+#             if attempt < max_retries - 1:
+#                 await asyncio.sleep(1)
     
-    return False
+#     return False
 
 @app.get("/health")
 async def health_check():
