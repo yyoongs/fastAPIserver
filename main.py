@@ -395,7 +395,7 @@ async def init_database():
         db_pool = AsyncConnectionPool(
             connection_string,
             min_size=5,
-            max_size=100,
+            max_size=60,
             timeout=30
         )
         logger.info("PostgreSQL 연결 풀 생성 완료")
