@@ -39,9 +39,9 @@ class QueueTask:
 
 # 큐 시스템 설정
 DB_WRITE_QUEUE = Queue(maxsize=10000)  # 최대 10,000개 작업 대기
-QUEUE_WORKERS = 5  # DB 쓰기 워커 수
+QUEUE_WORKERS = 10  # DB 쓰기 워커 수
 BATCH_SIZE = 10    # 배치 처리 크기
-BATCH_TIMEOUT = 2.0  # 배치 대기 시간 (초)
+BATCH_TIMEOUT = 0.5  # 배치 대기 시간 (초)
 
 # 큐 워커 상태 관리
 queue_workers_running = False
@@ -395,7 +395,7 @@ async def init_database():
         db_pool = AsyncConnectionPool(
             connection_string,
             min_size=5,
-            max_size=50,
+            max_size=100,
             timeout=30
         )
         logger.info("PostgreSQL 연결 풀 생성 완료")
